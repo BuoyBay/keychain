@@ -1,0 +1,841 @@
+' Generic-password storage: macOS Keychain, Linux Secret Service (libsecret) and
+' Windows Credential Manager. No preferences-file or plaintext fallback.
+
+''' Native credential store behind KeychainStore on the compiled target.
+Public Enum KeychainBackend As Integer
+    Unsupported = 0
+    MacKeychain = 1
+    SecretService = 2
+    WindowsCredentialManager = 3
+End Enum
+
+''' Safe classification of a failed operation. Absence is never an error: it is None/False.
+Public Enum KeychainErrorKind As Integer
+    Failed = 0
+    Unsupported = 1
+    LibraryUnavailable = 2
+    ServiceUnavailable = 3
+    Locked = 4
+    Denied = 5
+    Cancelled = 6
+    InvalidArgument = 7
+    IncompatibleEntry = 8
+End Enum
+
+''' Persistent is the default and matches macOS Keychain items. SessionOnly is an explicit opt-in.
+Public Enum KeychainPersistence As Integer
+    Persistent = 0
+    SessionOnly = 1
+End Enum
+
+' Domain used for outcomes this package classifies itself, rather than a native error.
+Private Function KeychainDomain() As String
+    Return "buoy-keychain"
+End Function
+
+Private Function ClassifyOSStatus(status As Integer) As KeychainErrorKind
+    Select Case status
+        Case -128
+            Return KeychainErrorKind.Cancelled
+        Case -25293, -34018, -25243, -61
+            Return KeychainErrorKind.Denied
+        Case -25308
+            Return KeychainErrorKind.Locked
+        Case -25291, -25294
+            Return KeychainErrorKind.ServiceUnavailable
+        Case -50
+            Return KeychainErrorKind.InvalidArgument
+        Case -4
+            Return KeychainErrorKind.Unsupported
+    End Select
+    Return KeychainErrorKind.Failed
+End Function
+
+Private Function CompiledBackend() As KeychainBackend
+    #If TargetMac Then
+        Return KeychainBackend.MacKeychain
+    #ElseIf TargetLinux Then
+        Return KeychainBackend.SecretService
+    #ElseIf TargetWindows Then
+        Return KeychainBackend.WindowsCredentialManager
+    #Else
+        Return KeychainBackend.Unsupported
+    #End If
+End Function
+
+''' Operation and Status are unchanged (Status is the macOS OSStatus there). Kind, Backend,
+''' Domain and NativeCode add a structured, secret-free classification on every platform.
+Public Class KeychainException Inherits Exception
+    Public Property Status As Integer
+    Public Property Operation As String
+    Public Property Kind As KeychainErrorKind = KeychainErrorKind.Failed
+    Public Property Backend As KeychainBackend = KeychainBackend.Unsupported
+    ''' "OSStatus", a GLib GError domain such as "secret-error", "Win32" or KeychainDomain().
+    Public Property Domain As String = ""
+    Public Property NativeCode As Integer = 0
+
+    Public Sub Constructor(operation As String, status As Integer)
+        Super.Constructor("Keychain " + operation + " failed (OSStatus " + Str(status) + ")", status)
+        Me.Status = status
+        Me.Operation = operation
+        Me.NativeCode = status
+        Me.Domain = "OSStatus"
+        Me.Backend = CompiledBackend()
+        Me.Kind = ClassifyOSStatus(status)
+    End Sub
+
+    ''' Messages contain only the operation, backend and native domain/code; never service,
+    ''' account, label, native error text or password content.
+    Public Sub Constructor(operation As String, kind As KeychainErrorKind, backend As KeychainBackend, domain As String, nativeCode As Integer)
+        Super.Constructor("Keychain " + operation + " failed (" + kind.Name + "; " + domain + " " + Str(nativeCode) + ")", nativeCode)
+        Me.Status = nativeCode
+        Me.Operation = operation
+        Me.Kind = kind
+        Me.Backend = backend
+        Me.Domain = domain
+        Me.NativeCode = nativeCode
+    End Sub
+End Class
+
+''' Legacy meaning, kept for existing callers: True only for the macOS Keychain.
+Public Function KeychainSupported() As Boolean
+    #If TargetMac Then
+        Return True
+    #Else
+        Return False
+    #End If
+End Function
+
+''' True when KeychainStore has a native backend for the compiled target (macOS, Linux, Windows).
+''' Implemented is not the same as available on this machine: see KeychainAvailable.
+Public Function KeychainBackendSupported() As Boolean
+    Return CompiledBackend() <> KeychainBackend.Unsupported
+End Function
+
+''' Library-only probe. Never connects to D-Bus, starts a keyring, prompts, or reads an item,
+''' so True does not prove a running, unlocked service.
+Public Function KeychainAvailable() As Boolean
+    #If TargetMac Then
+        Return True
+    #ElseIf TargetLinux Then
+        Return System.IsLibraryAvailable("libsecret-1.so.0") And System.IsLibraryAvailable("libglib-2.0.so.0") And System.IsLibraryAvailable("libgobject-2.0.so.0") And System.IsLibraryAvailable("libgio-2.0.so.0")
+    #ElseIf TargetWindows Then
+        Return System.IsLibraryAvailable("advapi32")
+    #Else
+        Return False
+    #End If
+End Function
+
+''' Feature-specific, nonprompting description of the compiled backend.
+Public Class KeychainCapabilities
+    Public Property Backend As KeychainBackend = KeychainBackend.Unsupported
+    ''' Implemented for this target; not a promise that the service works on this machine.
+    Public Property Supported As Boolean = False
+    ''' Same library-only probe as KeychainAvailable().
+    Public Property LibraryAvailable As Boolean = False
+    Public Property PersistentStorage As Boolean = False
+    Public Property SessionOnlyStorage As Boolean = False
+    ''' Windows target names match case-insensitively; other backends compare exactly.
+    Public Property CaseInsensitiveIdentity As Boolean = False
+    ''' Linux: DeletePassword removes every unlocked duplicate of the identity.
+    Public Property DeleteRemovesDuplicates As Boolean = False
+    ''' Length-based password storage (macOS). Linux libsecret text passwords are C strings.
+    Public Property EmbeddedNulPasswords As Boolean = False
+    ''' Largest UTF-8 password in bytes; 0 means no fixed bound is enforced by this package.
+    Public Property MaxPasswordBytes As Integer = 0
+    ''' UTF-16 code-unit limits for service/account; 0 means no package-enforced limit.
+    Public Property MaxServiceUnits As Integer = 0
+    Public Property MaxAccountUnits As Integer = 0
+End Class
+
+Public Function KeychainBackendCapabilities() As KeychainCapabilities
+    Dim caps As New KeychainCapabilities()
+    caps.Backend = CompiledBackend()
+    caps.Supported = KeychainBackendSupported()
+    caps.LibraryAvailable = KeychainAvailable()
+    #If TargetMac Then
+        caps.PersistentStorage = True
+        caps.EmbeddedNulPasswords = True
+    #ElseIf TargetLinux Then
+        caps.PersistentStorage = True
+        caps.SessionOnlyStorage = True
+        caps.DeleteRemovesDuplicates = True
+    #ElseIf TargetWindows Then
+        caps.PersistentStorage = True
+        caps.SessionOnlyStorage = True
+        caps.CaseInsensitiveIdentity = True
+        caps.MaxPasswordBytes = 2560
+        caps.MaxServiceUnits = 128
+        caps.MaxAccountUnits = 512
+    #End If
+    Return caps
+End Function
+
+#If TargetMac Then
+    Private Declare Function NativeClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+    Private Declare Function NewDictionary Lib "Foundation" Selector "new" (cls As Ptr) As Ptr
+    Private Declare Sub DictionarySet Lib "Foundation" Selector "setObject:forKey:" (dictionary As Ptr, value As Ptr, key As Ptr)
+    Private Declare Sub ReleaseObject Lib "CoreFoundation" Alias "CFRelease" (value As Ptr)
+    Private Declare Function FindSymbol Lib "c" Alias "dlsym" (handle As Ptr, name As String) As Ptr
+    Private Declare Function CopyPointer Lib "c" Alias "memcpy" (ByRef destination As Ptr, source As Ptr, size As Integer) As Ptr
+    Private Declare Function CreateData Lib "CoreFoundation" Alias "CFDataCreate" (allocator As Ptr, bytes As Ptr, length As Integer) As Ptr
+    Private Declare Function DataLength Lib "CoreFoundation" Alias "CFDataGetLength" (data As Ptr) As Integer
+    Private Declare Function DataBytes Lib "CoreFoundation" Alias "CFDataGetBytePtr" (data As Ptr) As Ptr
+    Private Declare Function SecRead Lib "buoy_security" Alias "SecItemCopyMatching" (query As Ptr, ByRef foundData As Ptr) As Int32
+    Private Declare Function SecAdd Lib "buoy_security" Alias "SecItemAdd" (attributes As Ptr, foundData As Ptr) As Int32
+    Private Declare Function SecUpdate Lib "buoy_security" Alias "SecItemUpdate" (query As Ptr, attributes As Ptr) As Int32
+    Private Declare Function SecDelete Lib "buoy_security" Alias "SecItemDelete" (query As Ptr) As Int32
+
+    Private Function NativeConstant(name As String) As Ptr
+        Dim address As Ptr = FindSymbol(CType(-2, Ptr), name)
+        If address = Nil Then Throw New KeychainException("resolve platform API", -4)
+        Dim value As Ptr = Nil
+        CopyPointer(value, address, 8)
+        Return value
+    End Function
+
+    Private Sub PutText(dictionary As Ptr, key As String, value As String)
+        Dim text As CFStringRef = CType(value, CFStringRef)
+        Try
+            DictionarySet(dictionary, text, NativeConstant(key))
+        Finally
+            ReleaseObject(text)
+        End Try
+    End Sub
+
+    Private Function PasswordQuery(service As String, account As String) As Ptr
+        Dim query As Ptr = NewDictionary(NativeClass("NSMutableDictionary"))
+        Try
+            DictionarySet(query, NativeConstant("kSecClassGenericPassword"), NativeConstant("kSecClass"))
+            PutText(query, "kSecAttrService", service)
+            PutText(query, "kSecAttrAccount", account)
+            Return query
+        Catch e As Exception
+            ReleaseObject(query)
+            Throw e
+        End Try
+    End Function
+#End If
+
+    ''' Strict UTF-8 without U+0000: Buoy strings cannot carry NUL (BUI-003), so such data
+    ''' is reported as an incompatible entry instead of being silently truncated.
+    Private Function IsPortableText(data As Bytes) As Boolean
+        Dim i As Integer = 0
+        Dim count As Integer = data.Count
+        While i < count
+            Dim lead As Integer = data.Item(i)
+            If lead = 0 Then Return False
+            If lead < 128 Then
+                i += 1
+                Continue While
+            End If
+            Dim needed As Integer = 0
+            Dim minimum As Integer = 0
+            Dim point As Integer = 0
+            If lead >= 194 And lead <= 223 Then
+                needed = 1
+                minimum = 128
+                point = lead - 192
+            ElseIf lead >= 224 And lead <= 239 Then
+                needed = 2
+                minimum = 2048
+                point = lead - 224
+            ElseIf lead >= 240 And lead <= 244 Then
+                needed = 3
+                minimum = 65536
+                point = lead - 240
+            Else
+                Return False
+            End If
+            If i + needed >= count Then Return False
+            For k As Integer = 1 To needed
+                Dim follow As Integer = data.Item(i + k)
+                If follow < 128 Or follow > 191 Then Return False
+                point = point * 64 + (follow - 128)
+            Next
+            If point < minimum Or point > 1114111 Then Return False
+            If point >= 55296 And point <= 57343 Then Return False
+            i += needed + 1
+        End While
+        Return True
+    End Function
+
+    ''' Native identities are C/wide strings: reject a NUL instead of truncating into another
+    ''' identity. Strings that already lost a NUL in the runtime (BUI-003) cannot be detected.
+    Private Sub RejectNul(value As String, what As String)
+        Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+        For i As Integer = 0 To encoded.Count - 1
+            If encoded.Item(i) = 0 Then Throw New InvalidArgumentException("A Keychain " + what + " cannot contain NUL")
+        Next
+    End Sub
+
+    Private Function IncompatibleEntry(operation As String) As KeychainException
+        Return New KeychainException(operation, KeychainErrorKind.IncompatibleEntry, CompiledBackend(), KeychainDomain(), 3)
+    End Function
+
+#If Not TargetMac Then
+    Private Function MissingLibrary(operation As String) As KeychainException
+        Return New KeychainException(operation, KeychainErrorKind.LibraryUnavailable, CompiledBackend(), KeychainDomain(), 2)
+    End Function
+#End If
+
+#If TargetLinux Then
+    ' Fixed schema shared with containers/integrations/linux/linuxsecrets.bui.
+    Private Function KeychainSchemaName() As String
+        Return "org.buoy.Integrations.Password"
+    End Function
+
+    Sequential Structure KeychainGError
+        Domain As UInt32
+        Code As Int32
+        Message As Ptr
+    End Structure
+
+    Private Optional Declare Function KeychainGStrHash Lib "libglib-2.0.so.0" Alias "g_str_hash" (value As Ptr) As UInt32
+    Private Optional Declare Function KeychainGStrEqual Lib "libglib-2.0.so.0" Alias "g_str_equal" (left As Ptr, right As Ptr) As Int32
+    Private Optional Declare Sub KeychainGFree Lib "libglib-2.0.so.0" Alias "g_free" (value As Ptr)
+    Private Optional Declare Function GStrDup Lib "libglib-2.0.so.0" Alias "g_strdup" (value As CString) As Ptr
+    Private Optional Declare Function GTableNew Lib "libglib-2.0.so.0" Alias "g_hash_table_new_full" (hash As Ptr, equal As Ptr, freeKey As Ptr, freeValue As Ptr) As Ptr
+    Private Optional Declare Function GTableInsert Lib "libglib-2.0.so.0" Alias "g_hash_table_insert" (table As Ptr, key As Ptr, value As Ptr) As Int32
+    Private Optional Declare Sub GTableUnref Lib "libglib-2.0.so.0" Alias "g_hash_table_unref" (table As Ptr)
+    Private Optional Declare Sub GErrorFree Lib "libglib-2.0.so.0" Alias "g_error_free" (error As Ptr)
+    Private Optional Declare Function GQuarkName Lib "libglib-2.0.so.0" Alias "g_quark_to_string" (quark As UInt32) As Ptr
+    Private Optional Declare Function GListLength Lib "libglib-2.0.so.0" Alias "g_list_length" (list As Ptr) As UInt32
+    Private Optional Declare Function GListNth Lib "libglib-2.0.so.0" Alias "g_list_nth_data" (list As Ptr, index As UInt32) As Ptr
+    Private Optional Declare Sub GListFreeFull Lib "libglib-2.0.so.0" Alias "g_list_free_full" (list As Ptr, destroy As Ptr)
+    Private Optional Declare Sub KeychainGObjectUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (instance As Ptr)
+    Private Optional Declare Function GBusGet Lib "libgio-2.0.so.0" Alias "g_bus_get_sync" (busType As Int32, cancellable As Ptr, ByRef error As Ptr) As Ptr
+    Private Optional Declare Function SecretStorev Lib "libsecret-1.so.0" Alias "secret_password_storev_sync" (schema As Ptr, attributes As Ptr, collection As CString, label As CString, password As Ptr, cancellable As Ptr, ByRef error As Ptr) As Int32
+    Private Optional Declare Function SecretLookupv Lib "libsecret-1.so.0" Alias "secret_password_lookupv_binary_sync" (schema As Ptr, attributes As Ptr, cancellable As Ptr, ByRef error As Ptr) As Ptr
+    Private Optional Declare Function SecretClearv Lib "libsecret-1.so.0" Alias "secret_password_clearv_sync" (schema As Ptr, attributes As Ptr, cancellable As Ptr, ByRef error As Ptr) As Int32
+    Private Optional Declare Function SecretValueText Lib "libsecret-1.so.0" Alias "secret_value_get_text" (value As Ptr) As Ptr
+    Private Optional Declare Function SecretValueData Lib "libsecret-1.so.0" Alias "secret_value_get" (value As Ptr, ByRef length As UInt64) As Ptr
+    Private Optional Declare Sub SecretValueUnref Lib "libsecret-1.so.0" Alias "secret_value_unref" (value As Ptr)
+    Private Optional Declare Function SecretSearch Lib "libsecret-1.so.0" Alias "secret_service_search_sync" (service As Ptr, schema As Ptr, attributes As Ptr, searchFlags As Int32, cancellable As Ptr, ByRef error As Ptr) As Ptr
+    Private Optional Declare Function SecretServiceGet Lib "libsecret-1.so.0" Alias "secret_service_get_sync" (serviceFlags As Int32, cancellable As Ptr, ByRef error As Ptr) As Ptr
+    Private Optional Declare Function SecretCollections Lib "libsecret-1.so.0" Alias "secret_service_get_collections" (service As Ptr) As Ptr
+    Private Optional Declare Function SecretCollectionLocked Lib "libsecret-1.so.0" Alias "secret_collection_get_locked" (collection As Ptr) As Int32
+    Private Optional Declare Function SecretItemLocked Lib "libsecret-1.so.0" Alias "secret_item_get_locked" (item As Ptr) As Int32
+    Private Optional Declare Function CTextLength Lib "c" Alias "strlen" (text As Ptr) As UInt64
+    Private Optional Declare Function CopyGError Lib "c" Alias "memcpy" (ByRef destination As KeychainGError, source As Ptr, count As UInt64) As Ptr
+
+    Private Function SafeDomain(quark As UInt32) As String
+        Dim name As Ptr = GQuarkName(quark)
+        If name = Nil Then Return "gerror-" + Str(quark)
+        Dim length As Integer = CTextLength(name)
+        If length < 1 Or length > 96 Then Return "gerror-" + Str(quark)
+        Dim raw As New Bytes()
+        raw.Append(name, length)
+        ' Quark names are static identifiers; still allow only identifier characters.
+        For i As Integer = 0 To raw.Count - 1
+            Dim c As Integer = raw.Item(i)
+            Dim allowed As Boolean = (c >= 97 And c <= 122) Or (c >= 65 And c <= 90) Or (c >= 48 And c <= 57) Or c = 45 Or c = 46 Or c = 95
+            If Not allowed Then Return "gerror-" + Str(quark)
+        Next
+        Return raw.ToString(Text.Encodings.UTF8)
+    End Function
+
+    Private Function ClassifyGError(domain As String, code As Integer) As KeychainErrorKind
+        If domain = "secret-error" Then
+            If code = 2 Then Return KeychainErrorKind.Locked
+            Return KeychainErrorKind.Failed
+        End If
+        If domain = "g-io-error-quark" Then
+            Select Case code
+                Case 19
+                    Return KeychainErrorKind.Cancelled
+                Case 14
+                    Return KeychainErrorKind.Denied
+                Case 13
+                    Return KeychainErrorKind.InvalidArgument
+                Case 15
+                    Return KeychainErrorKind.Unsupported
+                Case 1, 37, 38, 39, 45
+                    Return KeychainErrorKind.ServiceUnavailable
+            End Select
+            Return KeychainErrorKind.Failed
+        End If
+        If domain = "g-dbus-error-quark" Then
+            Select Case code
+                Case 2, 3, 4, 11, 12, 13, 15, 20, 23 To 34
+                    Return KeychainErrorKind.ServiceUnavailable
+                Case 9, 10
+                    Return KeychainErrorKind.Denied
+                Case 16
+                    Return KeychainErrorKind.InvalidArgument
+                Case 7
+                    Return KeychainErrorKind.Unsupported
+            End Select
+        End If
+        Return KeychainErrorKind.Failed
+    End Function
+
+    ''' Frees the GError and throws its domain/code. Native error text is never copied.
+    Private Sub ThrowGError(operation As String, error As Ptr, unavailable As Boolean)
+        Dim info As KeychainGError
+        Try
+            CopyGError(info, error, 16)
+        Finally
+            GErrorFree(error)
+        End Try
+        Dim domain As String = SafeDomain(info.Domain)
+        Dim kind As KeychainErrorKind = ClassifyGError(domain, info.Code)
+        If unavailable And kind = KeychainErrorKind.Failed Then kind = KeychainErrorKind.ServiceUnavailable
+        Throw New KeychainException(operation, kind, KeychainBackend.SecretService, domain, info.Code)
+    End Sub
+
+    Private Sub RequireLinuxLibraries(operation As String)
+        If Not KeychainAvailable() Then Throw MissingLibrary(operation)
+    End Sub
+
+    ''' Separates "no session bus" from Secret Service errors. Connects to the session bus only.
+    Private Sub RequireSessionBus(operation As String)
+        Dim error As Ptr = Nil
+        Dim connection As Ptr = GBusGet(2, Nil, error)
+        If connection <> Nil Then KeychainGObjectUnref(connection)
+        If error <> Nil Then ThrowGError(operation, error, True)
+        If connection = Nil Then Throw New KeychainException(operation, KeychainErrorKind.ServiceUnavailable, KeychainBackend.SecretService, KeychainDomain(), 4)
+    End Sub
+
+    Private Function SecretAttributes(service As String, account As String) As Ptr
+        Dim table As Ptr = GTableNew(CType(AddressOf KeychainGStrHash, Ptr), CType(AddressOf KeychainGStrEqual, Ptr), CType(AddressOf KeychainGFree, Ptr), CType(AddressOf KeychainGFree, Ptr))
+        If table = Nil Then Throw New KeychainException("allocate attributes", KeychainErrorKind.Failed, KeychainBackend.SecretService, KeychainDomain(), 5)
+        Try
+            GTableInsert(table, GStrDup(CType("xdg:schema", CString)), GStrDup(CType(KeychainSchemaName(), CString)))
+            GTableInsert(table, GStrDup(CType("buoy-application", CString)), GStrDup(CType(service, CString)))
+            GTableInsert(table, GStrDup(CType("buoy-key", CString)), GStrDup(CType(account, CString)))
+            Return table
+        Catch e As Exception
+            GTableUnref(table)
+            Throw e
+        End Try
+    End Function
+
+    ''' Lists every matching item, including locked ones, without unlocking or prompting
+    ''' (SECRET_SEARCH_ALL without SECRET_SEARCH_UNLOCK). 0 none, 1 unlocked only, 2 any locked.
+    Private Function MatchingItemState(operation As String, table As Ptr) As Integer
+        Dim error As Ptr = Nil
+        Dim list As Ptr = SecretSearch(Nil, Nil, table, 2, Nil, error)
+        If error <> Nil Then
+            If list <> Nil Then GListFreeFull(list, CType(AddressOf KeychainGObjectUnref, Ptr))
+            ThrowGError(operation, error, False)
+        End If
+        If list = Nil Then Return 0
+        Dim state As Integer = 0
+        Try
+            Dim count As Integer = GListLength(list)
+            For i As Integer = 0 To count - 1
+                Dim item As Ptr = GListNth(list, i)
+                If item <> Nil Then
+                    If state = 0 Then state = 1
+                    If SecretItemLocked(item) <> 0 Then state = 2
+                End If
+            Next
+        Finally
+            GListFreeFull(list, CType(AddressOf KeychainGObjectUnref, Ptr))
+        End Try
+        Return state
+    End Function
+
+    ''' GNOME Keyring hides items of a locked collection from attribute searches, so an empty
+    ''' result proves absence only when every collection is unlocked. Never prompts.
+    Private Function AnyCollectionLocked(operation As String) As Boolean
+        Dim error As Ptr = Nil
+        ' SECRET_SERVICE_LOAD_COLLECTIONS
+        Dim service As Ptr = SecretServiceGet(4, Nil, error)
+        If error <> Nil Then
+            If service <> Nil Then KeychainGObjectUnref(service)
+            ThrowGError(operation, error, True)
+        End If
+        If service = Nil Then Throw New KeychainException(operation, KeychainErrorKind.ServiceUnavailable, KeychainBackend.SecretService, KeychainDomain(), 4)
+        Dim locked As Boolean = False
+        Try
+            Dim list As Ptr = SecretCollections(service)
+            If list <> Nil Then
+                Try
+                    Dim count As Integer = GListLength(list)
+                    For i As Integer = 0 To count - 1
+                        Dim collection As Ptr = GListNth(list, i)
+                        If collection <> Nil Then
+                            If SecretCollectionLocked(collection) <> 0 Then locked = True
+                        End If
+                    Next
+                Finally
+                    GListFreeFull(list, CType(AddressOf KeychainGObjectUnref, Ptr))
+                End Try
+            End If
+        Finally
+            KeychainGObjectUnref(service)
+        End Try
+        Return locked
+    End Function
+
+    Private Function LockedItem(operation As String) As KeychainException
+        Return New KeychainException(operation, KeychainErrorKind.Locked, KeychainBackend.SecretService, KeychainDomain(), 6)
+    End Function
+
+    Private Function LinuxRead(service As String, account As String) As Optional Of String
+        RequireSessionBus("read")
+        Dim table As Ptr = SecretAttributes(service, account)
+        Try
+            Dim error As Ptr = Nil
+            Dim found As Ptr = SecretLookupv(Nil, table, Nil, error)
+            Try
+                If error <> Nil Then ThrowGError("read", error, False)
+                If found <> Nil Then
+                    Dim raw As New Bytes()
+                    ' Preserve the text-only contract, but validate the entire length-delimited value.
+                    If SecretValueText(found) = Nil Then Throw IncompatibleEntry("read")
+                    Dim length As UInt64 = 0
+                    Dim data As Ptr = SecretValueData(found, length)
+                    If length > 9223372036854775807 Then Throw IncompatibleEntry("read")
+                    If length > 0 Then
+                        If data = Nil Then Throw IncompatibleEntry("read")
+                        Dim byteCount As Integer = length
+                        raw.Append(data, byteCount)
+                    End If
+                    If Not IsPortableText(raw) Then Throw IncompatibleEntry("read")
+                    Return Some(raw.ToString(Text.Encodings.UTF8))
+                End If
+            Finally
+                If found <> Nil Then SecretValueUnref(found)
+            End Try
+            ' NULL is absence only if nothing matches: a locked item, or an unlocked one that
+            ' libsecret will not return as text, must not be reported as missing.
+            Dim hidden As Integer = MatchingItemState("read", table)
+            If hidden = 2 Then Throw LockedItem("read")
+            If hidden = 1 Then Throw IncompatibleEntry("read")
+            If AnyCollectionLocked("read") Then Throw LockedItem("read")
+            Return None
+        Finally
+            GTableUnref(table)
+        End Try
+    End Function
+
+    Private Sub LinuxWrite(service As String, account As String, password As String, label As String, persistence As KeychainPersistence)
+        Dim secret As Bytes = Bytes.FromString(password, Text.Encodings.UTF8)
+        For i As Integer = 0 To secret.Count - 1
+            If secret.Item(i) = 0 Then Throw New InvalidArgumentException("Secret Service text passwords cannot contain NUL")
+        Next
+        secret.Append(0)
+        Dim collection As String = "default"
+        If persistence = KeychainPersistence.SessionOnly Then collection = "session"
+        Dim itemLabel As String = label
+        If itemLabel = "" Then itemLabel = service
+        RequireSessionBus("write")
+        Dim table As Ptr = SecretAttributes(service, account)
+        Try
+            Dim error As Ptr = Nil
+            Dim stored As Int32 = SecretStorev(Nil, table, CType(collection, CString), CType(itemLabel, CString), secret.DataPtr(), Nil, error)
+            If error <> Nil Then ThrowGError("write", error, False)
+            If stored = 0 Then Throw New KeychainException("write", KeychainErrorKind.Failed, KeychainBackend.SecretService, KeychainDomain(), 7)
+        Finally
+            GTableUnref(table)
+        End Try
+    End Sub
+
+    Private Function LinuxDelete(service As String, account As String) As Boolean
+        RequireSessionBus("delete")
+        Dim table As Ptr = SecretAttributes(service, account)
+        Try
+            Dim error As Ptr = Nil
+            Dim removed As Int32 = SecretClearv(Nil, table, Nil, error)
+            If error <> Nil Then ThrowGError("delete", error, False)
+            ' Clear removes every unlocked match; a remaining (locked) duplicate is not deletion.
+            Dim remaining As Integer = MatchingItemState("delete", table)
+            If remaining = 2 Then Throw LockedItem("delete")
+            If remaining = 1 Then Throw New KeychainException("delete", KeychainErrorKind.Failed, KeychainBackend.SecretService, KeychainDomain(), 8)
+            If removed <> 0 Then Return True
+            If AnyCollectionLocked("delete") Then Throw LockedItem("delete")
+            Return False
+        Finally
+            GTableUnref(table)
+        End Try
+    End Function
+#End If
+
+#If TargetWindows Then
+    Sequential Structure KeychainCredential
+        CredentialFlags As UInt32
+        CredentialType As UInt32
+        TargetName As Ptr
+        Comment As Ptr
+        WrittenLow As UInt32
+        WrittenHigh As UInt32
+        BlobSize As UInt32
+        Blob As Ptr
+        Persistence As UInt32
+        AttributeCount As UInt32
+        Attributes As Ptr
+        TargetAlias As Ptr
+        UserName As Ptr
+    End Structure
+
+    Private Optional Declare Function CredRead Lib "advapi32" Alias "CredReadW" (targetName As Ptr, credentialType As UInt32, reserved As UInt32, ByRef allocated As Ptr) As Int32
+    Private Optional Declare Function CredWrite Lib "advapi32" Alias "CredWriteW" (ByRef entry As KeychainCredential, reserved As UInt32) As Int32
+    Private Optional Declare Function CredDelete Lib "advapi32" Alias "CredDeleteW" (targetName As Ptr, credentialType As UInt32, reserved As UInt32) As Int32
+    Private Optional Declare Sub CredFree Lib "advapi32" Alias "CredFree" (entry As Ptr)
+    Private Optional Declare Function LastError Lib "kernel32" Alias "GetLastError" () As UInt32
+    Private Optional Declare Function CopyCredential Lib "c" Alias "memcpy" (ByRef entry As KeychainCredential, source As Ptr, count As UInt64) As Ptr
+
+    Private Function ClassifyWin32(code As Integer) As KeychainErrorKind
+        Select Case code
+            Case 5
+                Return KeychainErrorKind.Denied
+            Case 1312
+                Return KeychainErrorKind.ServiceUnavailable
+            Case 87, 1004, 2202
+                Return KeychainErrorKind.InvalidArgument
+            Case 1223
+                Return KeychainErrorKind.Cancelled
+            Case 50
+                Return KeychainErrorKind.Unsupported
+        End Select
+        Return KeychainErrorKind.Failed
+    End Function
+
+    Private Function Win32Failure(operation As String, code As Integer) As KeychainException
+        Return New KeychainException(operation, ClassifyWin32(code), KeychainBackend.WindowsCredentialManager, "Win32", code)
+    End Function
+
+    Private Function WideText(value As String) As Bytes
+        Dim encoded As Bytes = value.AsUTF16LE()
+        encoded.Append(0)
+        encoded.Append(0)
+        Return encoded
+    End Function
+
+    ''' The Buoy/<service>/<account> namespace of WinCredentials.bui. Validated, never truncated.
+    Private Function CredentialTarget(service As String, account As String) As Bytes
+        Return WideText("Buoy/" + service + "/" + account)
+    End Function
+
+    Private Function WindowsRead(service As String, account As String) As Optional Of String
+        Dim target As Bytes = CredentialTarget(service, account)
+        ' Resolve the error accessor before the native call can set its error.
+        LastError()
+        Dim allocated As Ptr = Nil
+        If CredRead(target.DataPtr(), 1, 0, allocated) = 0 Then
+            Dim code As Integer = LastError()
+            If code = 1168 Then Return None
+            Throw Win32Failure("read", code)
+        End If
+        If allocated = Nil Then Throw New KeychainException("read", KeychainErrorKind.Failed, KeychainBackend.WindowsCredentialManager, KeychainDomain(), 9)
+        Try
+            Dim entry As KeychainCredential
+            CopyCredential(entry, allocated, 80)
+            If entry.CredentialType <> 1 Or entry.BlobSize > 2560 Then Throw IncompatibleEntry("read")
+            If entry.BlobSize > 0 And entry.Blob = Nil Then Throw IncompatibleEntry("read")
+            Dim raw As New Bytes()
+            If entry.BlobSize > 0 Then raw.Append(entry.Blob, entry.BlobSize)
+            ' Binary credentials (e.g. WinCredentials.StoreGeneric) stay untouched and readable there.
+            If Not IsPortableText(raw) Then Throw IncompatibleEntry("read")
+            Return Some(raw.ToString(Text.Encodings.UTF8))
+        Finally
+            CredFree(allocated)
+        End Try
+    End Function
+
+    Private Sub WindowsWrite(service As String, account As String, password As String, persistence As KeychainPersistence)
+        Dim secret As Bytes = Bytes.FromString(password, Text.Encodings.UTF8)
+        If secret.Count > 2560 Then Throw New InvalidArgumentException("Windows Credential Manager passwords are limited to 2560 UTF-8 bytes")
+        Dim target As Bytes = CredentialTarget(service, account)
+        Dim user As Bytes = WideText(account)
+        Dim entry As KeychainCredential
+        entry.CredentialFlags = 0
+        entry.CredentialType = 1
+        entry.TargetName = target.DataPtr()
+        entry.Comment = Nil
+        entry.WrittenLow = 0
+        entry.WrittenHigh = 0
+        entry.BlobSize = secret.Count
+        entry.Blob = Nil
+        If secret.Count > 0 Then entry.Blob = secret.DataPtr()
+        ' CRED_PERSIST_LOCAL_MACHINE (2) matches persistent Keychain items; SESSION (1) is opt-in.
+        entry.Persistence = 2
+        If persistence = KeychainPersistence.SessionOnly Then entry.Persistence = 1
+        entry.AttributeCount = 0
+        entry.Attributes = Nil
+        entry.TargetAlias = Nil
+        entry.UserName = user.DataPtr()
+        LastError()
+        If CredWrite(entry, 0) = 0 Then Throw Win32Failure("write", LastError())
+    End Sub
+
+    Private Function WindowsDelete(service As String, account As String) As Boolean
+        Dim target As Bytes = CredentialTarget(service, account)
+        LastError()
+        If CredDelete(target.DataPtr(), 1, 0) <> 0 Then Return True
+        Dim code As Integer = LastError()
+        If code = 1168 Then Return False
+        Throw Win32Failure("delete", code)
+    End Function
+#End If
+
+''' Scope each app/integration to its own stable reverse-DNS service name.
+Public Class KeychainStore
+    Private Property mService As String
+    Private Property mPersistence As KeychainPersistence = KeychainPersistence.Persistent
+    Public Property Service As String
+        Get
+            Return Me.mService
+        End Get
+    End Property
+
+    Public Property Persistence As KeychainPersistence
+        Get
+            Return Me.mPersistence
+        End Get
+    End Property
+
+    Public Sub Constructor(service As String)
+        If String.Trim(service) = "" Then Throw New InvalidArgumentException("A Keychain service is required")
+        Me.mService = service
+    End Sub
+
+    ''' Explicit persistence choice. SessionOnly is rejected on macOS when an operation runs.
+    Public Sub Constructor(service As String, persistence As KeychainPersistence)
+        If String.Trim(service) = "" Then Throw New InvalidArgumentException("A Keychain service is required")
+        If persistence <> KeychainPersistence.Persistent And persistence <> KeychainPersistence.SessionOnly Then
+            Throw New InvalidArgumentException("Unknown Keychain persistence mode")
+        End If
+        Me.mService = service
+        Me.mPersistence = persistence
+    End Sub
+
+    Private Sub ValidateAccount(account As String)
+        If account = "" Then Throw New InvalidArgumentException("A Keychain account is required")
+        If Not KeychainBackendSupported() Then Throw New KeychainException("unsupported platform", -4)
+        #If Not TargetMac Then
+            RejectNul(Me.mService, "service")
+            RejectNul(account, "account")
+        #End If
+        #If TargetMac Then
+            If Me.mPersistence = KeychainPersistence.SessionOnly Then Throw New KeychainException("session-only storage", KeychainErrorKind.Unsupported, KeychainBackend.MacKeychain, KeychainDomain(), 1)
+        #ElseIf TargetWindows Then
+            ' Reject identities Windows cannot represent exactly; never truncate or remap them.
+            If String.Contains(Me.mService, "/") Or String.Contains(Me.mService, "\\") Then Throw New InvalidArgumentException("A Windows Keychain service cannot contain / or \\")
+            If Me.mService.AsUTF16LE().Count > 256 Then Throw New InvalidArgumentException("A Windows Keychain service is limited to 128 UTF-16 code units")
+            If account.AsUTF16LE().Count > 1024 Then Throw New InvalidArgumentException("A Windows Keychain account is limited to 512 UTF-16 code units")
+        #End If
+    End Sub
+
+    ''' None means missing; denial, cancellation, locked stores and other native errors throw.
+    Public Function GetPassword(account As String) As Optional Of String
+        Me.ValidateAccount(account)
+        #If TargetMac Then
+            Dim query As Ptr = PasswordQuery(Me.mService, account)
+            Dim foundData As Ptr = Nil
+            Try
+                DictionarySet(query, NativeConstant("kCFBooleanTrue"), NativeConstant("kSecReturnData"))
+                DictionarySet(query, NativeConstant("kSecMatchLimitOne"), NativeConstant("kSecMatchLimit"))
+                Dim status As Integer = SecRead(query, foundData)
+                If status = -25300 Then Return None
+                If status <> 0 Then Throw New KeychainException("read", status)
+                Dim bytes As New Bytes()
+                Dim length As Integer = DataLength(foundData)
+                If length > 0 Then bytes.Append(DataBytes(foundData), length)
+                If Not IsPortableText(bytes) Then Throw IncompatibleEntry("read")
+                Return Some(bytes.ToString(Text.Encodings.UTF8))
+            Finally
+                If foundData <> Nil Then ReleaseObject(foundData)
+                ReleaseObject(query)
+            End Try
+        #ElseIf TargetLinux Then
+            RequireLinuxLibraries("read")
+            Try
+                Return LinuxRead(Me.mService, account)
+            Catch e As LibraryUnavailableException
+                Throw MissingLibrary("read")
+            End Try
+        #ElseIf TargetWindows Then
+            Try
+                Return WindowsRead(Me.mService, account)
+            Catch e As LibraryUnavailableException
+                Throw MissingLibrary("read")
+            End Try
+        #Else
+            Return None
+        #End If
+    End Function
+
+    ''' Create or replace exactly one service/account password; duplicate races retry update.
+    Public Sub SetPassword(account As String, password As String, label As String = "")
+        Me.ValidateAccount(account)
+        #If TargetMac Then
+            Dim query As Ptr = PasswordQuery(Me.mService, account)
+            Dim attributes As Ptr = Nil
+            Dim data As Ptr = Nil
+            Try
+                attributes = NewDictionary(NativeClass("NSMutableDictionary"))
+                Dim bytes As Bytes = Bytes.FromString(password, Text.Encodings.UTF8)
+                data = CreateData(Nil, bytes.DataPtr(), bytes.Count)
+                If data = Nil Then Throw New KeychainException("allocate password", -108)
+                DictionarySet(attributes, data, NativeConstant("kSecValueData"))
+                If label <> "" Then PutText(attributes, "kSecAttrLabel", label)
+                Dim status As Integer = SecUpdate(query, attributes)
+                If status = -25300 Then
+                    DictionarySet(query, data, NativeConstant("kSecValueData"))
+                    If label <> "" Then PutText(query, "kSecAttrLabel", label)
+                    status = SecAdd(query, Nil)
+                    If status = -25299 Then
+                        ' Remove add-only data before retrying the identity query.
+                        ReleaseObject(query)
+                        query = Nil
+                        query = PasswordQuery(Me.mService, account)
+                        status = SecUpdate(query, attributes)
+                    End If
+                End If
+                If status <> 0 Then Throw New KeychainException("write", status)
+            Finally
+                If data <> Nil Then ReleaseObject(data)
+                If attributes <> Nil Then ReleaseObject(attributes)
+                If query <> Nil Then ReleaseObject(query)
+            End Try
+        #ElseIf TargetLinux Then
+            RequireLinuxLibraries("write")
+            Try
+                LinuxWrite(Me.mService, account, password, label, Me.mPersistence)
+            Catch e As LibraryUnavailableException
+                Throw MissingLibrary("write")
+            End Try
+        #ElseIf TargetWindows Then
+            Try
+                WindowsWrite(Me.mService, account, password, Me.mPersistence)
+            Catch e As LibraryUnavailableException
+                Throw MissingLibrary("write")
+            End Try
+        #End If
+    End Sub
+
+    ''' Delete only this exact service/account. False means the item was already absent.
+    Public Function DeletePassword(account As String) As Boolean
+        Me.ValidateAccount(account)
+        #If TargetMac Then
+            Dim query As Ptr = PasswordQuery(Me.mService, account)
+            Try
+                Dim status As Integer = SecDelete(query)
+                If status = -25300 Then Return False
+                If status <> 0 Then Throw New KeychainException("delete", status)
+                Return True
+            Finally
+                ReleaseObject(query)
+            End Try
+        #ElseIf TargetLinux Then
+            RequireLinuxLibraries("delete")
+            Try
+                Return LinuxDelete(Me.mService, account)
+            Catch e As LibraryUnavailableException
+                Throw MissingLibrary("delete")
+            End Try
+        #ElseIf TargetWindows Then
+            Try
+                Return WindowsDelete(Me.mService, account)
+            Catch e As LibraryUnavailableException
+                Throw MissingLibrary("delete")
+            End Try
+        #Else
+            Return False
+        #End If
+    End Function
+End Class

@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "name": "keychain",
+  "version": "0.1.0",
+  "description": "Scoped generic-password storage: macOS Keychain, Linux Secret Service and Windows Credential Manager, with structured native errors",
+  "platforms": [
+    "arm64-apple-macos",
+    "x86_64-apple-macos",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "arm64-pc-windows-msvc"
+  ],
+  "libraries": [
+    {
+      "libName": "buoy_security",
+      "system": true
+    }
+  ]
+}
