@@ -1,4 +1,4 @@
-# Store scoped credentials in native OS credential stores
+# Scoped credentials in native OS stores
 
 There is no enumerate-all, read-all or delete-all API, no plaintext or
 preferences-file fallback, no master-password collection, and importing the
