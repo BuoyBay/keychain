@@ -2,7 +2,7 @@
     "schema": 1,
     "name": "keychain",
     "version": "0.1.0",
-    "description": "Scoped credentials in native OS stores",
+    "description": "Native credential store",
     "platforms": [
         "arm64-apple-macos",
         "x86_64-apple-macos",
