@@ -109,8 +109,6 @@ Messages contain only the operation, backend and native domain/code; never servi
 
 Returns: no value.
 
-## Keychain functions
-
 ### KeychainSupported
 
 `Public Function KeychainSupported() As Boolean`

@@ -4,7 +4,7 @@ Reusable generic-password storage, independent of Calls and CouchDB. One API,
 three native backends: the macOS Keychain, the freedesktop Secret Service on
 Linux (through libsecret), and Windows Credential Manager. Install
 `packages/keychain-0.1.0.buipkg` in another Buoy project's `packages/`
-directory and use `Import keychain`. Build it with `python3 tools/build_keychain.py`.
+directory and use `Import keychain`.
 
 | API | Behavior |
 | --- | --- |
@@ -143,9 +143,3 @@ are reported as `IncompatibleEntry` rather than truncated.
 `link/*/libbuoy_security.tbd` contains symbol declarations only. Its install name
 points to Apple's system Security framework, which is loaded at runtime; no
 third-party security binary is bundled.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-

@@ -19,7 +19,7 @@ Use a consuming source filename such as `main.bui`; a local module named exactly
 
 The example is compiler-checked as a complete Buoy module. Functions and Subs are intended to be called from the consuming app at the appropriate user action or lifecycle event.
 
-```buoy
+```basic
 Import keychain
 
 Function ReadSavedPassword(account As String) As Optional Of String
